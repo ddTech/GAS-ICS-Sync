@@ -1,25 +1,44 @@
 /**
  * Takes an intended frequency in minutes and adjusts it to be the closest 
- * acceptable value to use Google "everyMinutes" trigger setting (i.e. one of
- * the following values: 1, 5, 10, 15, 30).
+ * acceptable value to use Google "everyMinutes" trigger setting 
+ * (i.e. one of the following values: 1, 5, 10, 15, 30).
+ * 
+ * DD 2022-08-28
+ * Values >= 45 now return an hourly minute value (i.e. 60, 120, 180, etc.)
  *
  * @param {?integer} The manually set frequency that the user intends to set.
- * @return {integer} The closest valid value to the intended frequency setting. Defaulting to 15 if no valid input is provided.
+ * @return {integer} The closest valid value to the intended frequency setting. 
+ *                   Defaulting to 15 if no valid input is provided.
  */
 function getValidTriggerFrequency(origFrequency) {
-  if (!origFrequency > 0) {
+  let adjFrequency = 15;
+  
+  if (origFrequency > 0) {
+
+    if (origFrequency < 45){  
+      // -- create valid frequency for an "everyMinute" trigger. One of 1, 5, 10, 15, 30
+      adjFrequency = Math.round(origFrequency/5) * 5; // Set the number to be the closest divisible-by-5
+      adjFrequency = Math.max(adjFrequency, 1); // Make sure the number is at least 1 (0 is not valid for the trigger)
+      adjFrequency = Math.min(adjFrequency, 15); // Make sure the number is at most 15 (will check for the 30 value below)
+      
+      if((adjFrequency == 15) && (Math.abs(origFrequency-30) < Math.abs(origFrequency-15))){
+        adjFrequency = 30; // If we adjusted to 15, but the original number is actually closer to 30, set it to 30 instead
+      }
+      
+    } else {
+      // -- create valid frequency for an "everyHour" trigger
+      adjFrequency = Math.max(Math.round(origFrequency/60),1) * 60; // set the frequency to an hourly value
+    }
+    
+    if (adjFrequency !== origFrequency){
+      Logger.log("Intended frequency = "+ origFrequency +", Adjusted frequency = "+ adjFrequency);
+    }
+
+  } else{
     Logger.log("No valid frequency specified. Defaulting to 15 minutes.");
-    return 15;
-  }
-  
-  var adjFrequency = Math.round(origFrequency/5) * 5; // Set the number to be the closest divisible-by-5
-  adjFrequency = Math.max(adjFrequency, 1); // Make sure the number is at least 1 (0 is not valid for the trigger)
-  adjFrequency = Math.min(adjFrequency, 15); // Make sure the number is at most 15 (will check for the 30 value below)
-  
-  if((adjFrequency == 15) && (Math.abs(origFrequency-30) < Math.abs(origFrequency-15)))
-    adjFrequency = 30; // If we adjusted to 15, but the original number is actually closer to 30, set it to 30 instead
-  
-  Logger.log("Intended frequency = "+origFrequency+", Adjusted frequency = "+adjFrequency);
+
+  }  // if (origFrequency > 0)
+    
   return adjFrequency;
 }
 
@@ -30,8 +49,10 @@ String.prototype.includes = function(phrase){
 /**
  * Takes an array of ICS calendars and target Google calendars and combines them
  *
- * @param {Array.string} calendarMap - User-defined calendar map
- * @return {Array.string} Condensed calendar map
+ * @param  {Array.string} calendarMap - User-defined calendar map with
+ *         [ url, targetCalendarName, colorID (optional) ]
+ * @return {Array.string} Condensed calendar map formated like
+ *         [ targetCalendarName, [[url1, colorID1], [url2, colorID2], ... , [urln, colorIDn]] ]
  */
 function condenseCalendarMap(calendarMap){
   var result = [];
@@ -44,10 +65,12 @@ function condenseCalendarMap(calendarMap){
       }
     }
 
-    if (index > -1)
+    if (index > -1){
       result[index][1].push([mapping[0],mapping[2]]);
-    else
+    } else {
       result.push([ mapping[1], [[mapping[0],mapping[2]]] ]);
+    }  
+
   }
 
   return result;
@@ -69,35 +92,181 @@ function deleteAllTriggers(){
  * Gets the ressource from the specified URLs.
  *
  * @param {Array.string} sourceCalendarURLs - Array with URLs to fetch
+ * @param {integer} tnCalendarGroup - index of the current calendar or calendar group 
  * @return {Array.string} The ressources fetched from the specified URLs
  */
-function fetchSourceCalendars(sourceCalendarURLs){
-  var result = []
-  for (var source of sourceCalendarURLs){
+function fetchSourceCalendars(sourceCalendarURLs, tnCalendarGroup){
+  var result = [];
+
+  var cLastModifiedKey = "", cLastModified="";
+
+  // No optimized download on calendars merged from multiple sources
+  // unless removeEventsFromCalendar = false (1) or with optional post fetch (2)  
+  var lRespectLastModified = 
+        gnRespectLastModified == 2 ||
+        ( gnRespectLastModified == 1 && (sourceCalendarURLs.length == 1 || ! removeEventsFromCalendar) ) ;
+
+  var nIndex = 0; // index of iCal URL in current calendar group (i.e. target calendar)
+  var nUnchanged = 0; 
+  var oRequestHeaderOptions = {};   
+   
+  for (var source of sourceCalendarURLs){    
     var url = source[0].replace("webcal://", "https://");
     var colorId = source[1];
     
     callWithBackoff(function() {
-      var urlResponse = UrlFetchApp.fetch(url, { 'validateHttpsCertificates' : false, 'muteHttpExceptions' : true });
+
+      // DD 2022-08-24
+      // see if we have Last-Modified information for that index
+      // and if so, add 'If-Modified-Since' header to the request
+      if (lRespectLastModified){
+        cLastModifiedKey = tnCalendarGroup.toString().padStart(3,"0") +"_"+ nIndex.toString().padStart(3, "0");
+        cLastModified = PropertiesService.getUserProperties().getProperty(cLastModifiedKey);
+        //Logger.log("LastModifiedKey:"+ cLastModifiedKey);
+      }
+
+      if (cLastModified){
+        // Subsequent request with Last-Modified information available
+        oRequestHeaderOptions = { 'validateHttpsCertificates' : false,
+                                  'muteHttpExceptions': true,
+                                  'headers' : {'If-Modified-Since' : cLastModified} 
+                                };
+
+        Logger.log("Request calendar newer than: " + cLastModified);                     
+
+      } else {
+        // First request or not optimized. Exclude "If-LastModified" header 
+        oRequestHeaderOptions = { 'validateHttpsCertificates' : false,
+                                  'muteHttpExceptions': true
+                                };
+      }
+
+      var urlResponse = UrlFetchApp.fetch(url, oRequestHeaderOptions);
+
       if (urlResponse.getResponseCode() == 200){
+        // HTTP OK. Check if format generally is OK and push to results
+        // or bail out if not.
+
+        // var urlContent = urlResponse.getContentText();
+        // if(!urlContent.includes("BEGIN:VCALENDAR")){
         var urlContent = RegExp("(BEGIN:VCALENDAR.*?END:VCALENDAR)", "s").exec(urlResponse.getContentText());
         if(urlContent == null){
           Logger.log("[ERROR] Incorrect ics/ical URL: " + url);
           return;
-        }
-        else{
+
+        } else{
           result.push([urlContent[0], colorId]);
+          // Logger.log("Result: " + result.length);
+
+          if (lRespectLastModified){  
+            // read 'Last-Modified' field from the response header and 
+            // save the value for later.
+            let urlHeaders = urlResponse.getHeaders();
+            let cLM = urlHeaders['Last-Modified'] || "";
+            if (cLM){
+              Logger.log("Response: Last-Modified: "+ cLM);                
+              PropertiesService.getUserProperties().setProperty(cLastModifiedKey, cLM);
+
+            } else {
+              Logger.log("Response: 'Last-Modified' not supplied");  
+            }            
+
+          }
+
           return;
-        }     
-      }
-      else{ //Throw here to make callWithBackoff run again
-        throw "Error: Encountered HTTP error " + urlResponse.getResponseCode() + " when accessing " + url; 
+        }
+
+      } else if (urlResponse.getResponseCode() == 304){
+        // HTTP not modified. Add an empty result for now
+        nUnchanged++;
+        result.push(["", colorId]);
+        Logger.log("Not modified");  
+
+      } else{ //Throw here to make callWithBackoff run again
+
+        throw "Error: Encountered " + urlReponse.getReponseCode() + " when accessing " + url; 
+
       }
     }, defaultMaxRetries);
+
+    nIndex = nIndex + 1;
+
   }
   
+  
+  if (lRespectLastModified){
+    // If we want to respect'Not Modified' and have multiple ICS-files to be merged into one target calendar, 
+    // we will run into a problem if some, but not all of them have been modified. 
+    // In this case all events would be deleted during the parsing process. 
+    // Therefore, we will have to fetch the missing ones ignoring the "Last Modified" flag.
+    //
+    // This is not necessary if none or all of them have been modified.
+
+    if (nUnchanged == sourceCalendarURLs.length){
+      // none has been modified -> return empty result; no parsing necessary
+      Logger.log("None of "+ sourceCalendarURLs.length.toString() +" have been modified")
+      result = [];
+
+    } else if(nUnchanged > 0 && nUnchanged < sourceCalendarURLs.length){
+      // some but not all have new data -> refetch the missing ones and parse all of them
+      Logger.log(nUnchanged.toString() +" of "+ sourceCalendarURLs.length.toString() +" have not been modified")
+      result = fetchMissingCalendars(sourceCalendarURLs, result);
+
+    }
+  }
+
   return result;
 }
+
+/**
+ * Fetch missing ics files when multiple iCals shall be merged into one
+ * target calendar and some of them have not been modified since last update. 
+ * Called from fetchSourceCalendars()
+ * 
+ * This will scan through the current results and forc a calendar fetch
+ * for the empty ones. 
+ * Indices in sourceCalendarURLs and taResult refer to the same sources.
+ *
+ * @param {Array.string} sourceCalendarURLs - Array with URLs to fetch
+ * @param {Array.string} taResult - Array with iCal data of the fetched iCals 
+ * 
+ * @return {Array.string} The ressources fetched from the specified URLs
+ */
+function fetchMissingCalendars(sourceCalendarURLs, taResult){  
+
+//  Logger.log("fetchMissingCalendars:\r\nSource URLs: %s\r\n Result: %s",sourceCalendarURLs, taResult);
+
+  for (var i = 0; i < taResult.length; i++){
+
+    if (taResult[i][0] == ""){
+         
+      var url = sourceCalendarURLs[i][0].replace("webcal://", "https://");      
+      
+      callWithBackoff(function() {
+        var urlResponse = UrlFetchApp.fetch(url, { 'validateHttpsCertificates' : false, 'muteHttpExceptions' : true });
+        if (urlResponse.getResponseCode() == 200){
+          var urlContent = RegExp("(BEGIN:VCALENDAR.*?END:VCALENDAR)", "s").exec(urlResponse.getContentText());
+          if(urlContent == null){
+            Logger.log("[ERROR] Incorrect ics/ical URL: " + url);
+            return;
+          }
+          else{
+            taResult[i][0] = urlContent[0];
+            return;
+          }     
+        }
+        else{ //Throw here to make callWithBackoff run again
+          throw "Error: Encountered HTTP error " + urlResponse.getResponseCode() + " when accessing " + url; 
+        }
+      }, defaultMaxRetries);
+    }
+  }
+
+  //Logger.log("fetchMissingCalendars End:\r\nSource URLs: %s\r\n Result: %s",sourceCalendarURLs, taResult);
+  
+  return taResult;
+}
+
 
 /**
  * Gets the user's Google Calendar with the specified name.
@@ -137,6 +306,7 @@ function parseResponses(responses){
   for (var itm of responses){
     var resp = itm[0];
     var colorId = itm[1];
+
     var jcalData = ICAL.parse(resp);
     var component = new ICAL.Component(jcalData);
 
@@ -147,8 +317,9 @@ function parseResponses(responses){
     }
     
     var allEvents = component.getAllSubcomponents("vevent");
-    if (colorId != undefined)
+    if (colorId != undefined){
       allEvents.forEach(function(event){event.addPropertyWithValue("color", colorId);});
+    }  
 
     var calName = component.getFirstPropertyValue("x-wr-calname") || component.getFirstPropertyValue("name");
     if (calName != null)
@@ -280,31 +451,56 @@ function createEvent(event, calendarTz){
     };
   }
   else{ //Normal (not all-day) event
+
+    /*Logger.log(icalEvent.startDate);
+    Logger.log(icalEvent.startDate.toString());
+    Logger.log(icalEvent.startDate.zone.tzid);
+    */
+   
+
     var tzid = icalEvent.startDate.timezone;
-    if (tzids.indexOf(tzid) == -1){
 
-      var oldTzid = tzid;
-      if (tzid in tzidreplace){
-        tzid = tzidreplace[tzid];
-      }
-      else{
-        //floating time
-        tzid = calendarTz;
+    // on Z-Times either set a valid tzid
+    //
+    // if (tzid == "Z"){
+    //   tzid = "UTC";  // or = icalEvent.startDate.zone.tzid
+    // } 
+    //
+    // or use these times directly
+    if (tzid == "Z") {
+      newEvent = {
+        start: { dateTime : icalEvent.startDate.toString() },
+        end: { dateTime : icalEvent.endDate.toString()}
+      };
+    
+    } else {
+
+      if (tzids.indexOf(tzid) == -1){
+
+        let oldTzid = tzid;
+        if (tzid in tzidreplace){
+          tzid = tzidreplace[tzid];
+        }
+        else{
+          //floating time
+          tzid = calendarTz;
+        }
+
+        Logger.log("Converting ICS timezone " + oldTzid + " to Google Calendar (IANA) timezone " + tzid);
       }
 
-      Logger.log("Converting ICS timezone " + oldTzid + " to Google Calendar (IANA) timezone " + tzid);
+      newEvent = {
+        start: {
+          dateTime : icalEvent.startDate.toString(),
+          timeZone : tzid
+        },
+        end: {
+          dateTime : icalEvent.endDate.toString(),
+          timeZone : tzid
+        }
+      };
+
     }
-
-    newEvent = {
-      start: {
-        dateTime : icalEvent.startDate.toString(),
-        timeZone : tzid
-      },
-      end: {
-        dateTime : icalEvent.endDate.toString(),
-        timeZone : tzid
-      },
-    };
   }
   
   if (addAttendees && event.hasProperty('attendee')){
@@ -434,6 +630,7 @@ function createEvent(event, calendarTz){
       break;
   }
 
+  
   if (icalEvent.isRecurring()){
     // Calculate targetTZ's UTC-Offset
     var calendarUTCOffset = 0;
@@ -455,7 +652,7 @@ function createEvent(event, calendarTz){
   if (event.hasProperty('color')){
     newEvent.colorId = event.getFirstPropertyValue('color').toString();
   }
-
+  
   return newEvent;
 }
 
@@ -482,6 +679,7 @@ function checkSkipEvent(event, icalEvent){
       var next;
       var newStartDate;
       var countskipped = 0;
+
       while (next = expand.next()) {
         var diff = next.subtractDate(icalEvent.startDate);
         var tempEnd = icalEvent.endDate.clone();
@@ -502,7 +700,7 @@ function checkSkipEvent(event, icalEvent){
         var newEndDate = icalEvent.endDate;
         icalEvent.endDate = newEndDate;
         icalEvent.startDate = newStartDate;
-
+        
         var rrule = event.getFirstProperty('rrule');
         var recur = rrule.getFirstValue();
         if (recur.isByCount()) {
@@ -901,6 +1099,7 @@ var backoffRecoverableErrors = [
   "service invoked too many times in a short time",
   "rate limit exceeded",
   "internal error"];
+
 function callWithBackoff(func, maxRetries) {
   var tries = 0;
   var result;
@@ -919,6 +1118,8 @@ function callWithBackoff(func, maxRetries) {
               return err.toLowerCase().includes(e);
             }) ) {
         throw err;
+
+
       } else if ( tries > maxRetries) {
         Logger.log(`Error, giving up after trying ${maxRetries} times [${err}]`);
         return null;
@@ -931,6 +1132,7 @@ function callWithBackoff(func, maxRetries) {
   }
   return null;
 }
+
 
 /**
  * Checks for a new version of the script at https://github.com/derekantrican/GAS-ICS-Sync/releases.
